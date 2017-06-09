@@ -1,0 +1,204 @@
+---
+title: "Practical Machine Learning - Course Project"
+author: "Nicolaas Kuit"
+date: "June 6, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, warning=FALSE, message=FALSE}
+library(caret)
+library(doParallel)
+library(dplyr)
+library(ggplot2)
+library(parallel)
+library(randomForest)
+library(tidyr)
+```
+
+# Executive Summary
+
+This report aims to predict how well a person performs a Unilateral Dumbbell Biceps Curl. Data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants is used to classify the bicep curl into one of 5 different movements (*classe* A-E).  
+A random forest algorithm is used to classify the movements with an accuracy of around 97%.
+
+```{r set_seed}
+set.seed(777)
+```
+
+# Data Processing
+
+### Load data
+```{r download_files}
+csvTrainingFileName <- "pml-training.csv"
+csvTestingFileName <- "pml-testing.csv"
+
+if(!file.exists(csvTrainingFileName)) {
+    download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", csvTrainingFileName)
+}
+
+if(!file.exists(csvTestingFileName)) {
+    download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", csvTestingFileName)
+}
+
+# The provided training set will be separated into a training and testing set
+rawTraining <- read.csv(csvTrainingFileName, stringsAsFactors = FALSE)
+
+# Using the test set as my validation set.
+rawValidation <- read.csv(csvTestingFileName, stringsAsFactors = FALSE)
+```
+### Clean up data
+```{r data_cleanup}
+# First we'll remove any columns where there are many NAs
+naProps <- apply(is.na(rawTraining), 2, sum) / nrow(rawTraining)
+
+# We see there are two groups of columns. One with zero NAs, and one with more than 90% NAs.
+table(naProps)
+
+# Remove all the columns with more than 90% NAs.
+naColumnNames <- names(naProps[naProps >= 0.90])
+
+rawTraining <- select(rawTraining, -one_of(naColumnNames))
+rawValidation <- select(rawValidation, -one_of(naColumnNames))
+
+# Now look for columns where there are many blank character strings
+blankProps <- apply(rawTraining == "", 2, sum) / nrow(rawTraining)
+table(blankProps)
+
+blankColumnNames <- names(blankProps[blankProps >= 0.90])
+
+# Remove all the columns with more than 90% blank character strings.
+rawTraining <- select(rawTraining, -one_of(blankColumnNames))
+rawValidation <- select(rawValidation, -one_of(blankColumnNames))
+
+# Remove columns related to time. We're just classifying, we're not trying to predict future movements
+rawTraining <- select(rawTraining, 
+                      -X,
+                      -raw_timestamp_part_1, 
+                      -raw_timestamp_part_2, 
+                      -cvtd_timestamp, 
+                      -new_window, 
+                      -num_window)
+
+rawValidation <- select(rawValidation, 
+                      -X,
+                      -raw_timestamp_part_1, 
+                      -raw_timestamp_part_2, 
+                      -cvtd_timestamp, 
+                      -new_window, 
+                      -num_window)
+
+# Convert the classe (outcome) to a factor
+rawTraining$classe <- factor(rawTraining$classe)
+rawTraining$user_name <- factor(rawTraining$user_name)
+
+rawValidation$user_name <- factor(rawValidation$user_name)
+
+# Now we're left with a data frame containing only numeric predictors and one outcome (classe).
+```
+
+### Create our data partitions  
+
+```{r}
+# For our model creation, we need a training, and test set
+inTrain <- createDataPartition(rawTraining$classe, p = 0.75, list = FALSE)
+training <- rawTraining[inTrain,]
+testing <- rawTraining[-inTrain,]
+```
+
+### Check for near zero variance in the predictors
+We can see below that there are no zero variance predictors.
+
+```{r}
+classeCol <- ncol(training)
+nzv <- nearZeroVar(training[,-classeCol], saveMetrics = TRUE)
+sum(nzv$zeroVar)
+```
+
+## Exploratory Analysis
+
+### Plot Histogram of Roll Belt
+Plotting the histogram of the variable *roll_belt*, we can clearly see two separate groups (left & right). With such a clear separation, we can use a decision tree model to predict the outcome *classe*.
+
+```{r plot_roll_belt, warning=FALSE}
+g <- ggplot(data = training, aes(roll_belt, fill = user_name)) +
+    facet_grid(classe ~ .) +
+    geom_histogram() +
+    xlab("Roll Belt") +
+    ggtitle("Histogram of Roll Belt across classe")
+print(g)
+```
+
+
+## Model Creation
+
+Remove the *user_name* variable since we'd like to apply this model to any new user to be able to tell them whether they are doing the exercise correctly or not.
+```{r remove_user_name}
+training <- select(training, -user_name)
+validation <- select(rawValidation, -user_name)
+```
+
+### Create a smaller training set for Random Forest
+
+```{r}
+# Create a smaller subset as randomForest takes a long time to run.
+inSmallTraining <- createDataPartition(training$classe, p = 0.3, list = FALSE)
+smallTraining <- training[inSmallTraining,]
+smallRemaining <- training[-inSmallTraining,]
+```
+
+**Random forest** is used to model the classe outcome. It us usually the best for non-linear classification problems. In order to estimate the test set accuracy, cross validation is performed 5 times. More cross validations could be performed, but it runs very slowly against the random forest algorithm.
+
+```{r cache=TRUE}
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+
+# Here is where we tell train to cross validate 5 times.
+cvControl <- trainControl(method = "cv", number = 5, allowParallel = TRUE)
+
+modrf <- train(classe ~ ., data = smallTraining, method="rf",
+              trControl = cvControl,
+              prox = TRUE, allowParallel = TRUE)
+
+stopCluster(cluster)
+registerDoSEQ()
+
+```
+
+Here we can see that the best set of trees is where 2 variables are picked at random for each decision made in the tree creation process.
+```{r}
+modrf
+```
+
+Below we can see that the out of sample error is 3.1%. We can also see that the model struggles to correctly predict classe *D* with class.error = 0.06.
+```{r}
+modrf$finalModel
+```
+
+## Performance against test data
+Our initial data split into training (75%), validation (25%).  
+Training data was then split into:  
+- small training (30%)  
+- testing (70%)  
+
+So our model was built on 75% x 30% = 22.5% of the original data.  
+Below our accuracy is 97.34%, which means our error rate is 2.66% (lower than the estimated out of sample error of 3.1%).  
+
+```{r}
+confusionMatrix(predict(modrf, smallRemaining), smallRemaining$classe)
+```
+
+## Performance against validation data
+
+Below our accuracy is 97.33%, which means our error rate is 2.67% (lower than the estimated out of sample error of 3.1%).  
+
+It is surprizing that the out of sample error rate is below our estimated OOB error rate.  
+
+```{r}
+confusionMatrix(predict(modrf, testing), testing$classe)
+```
+
+# Conclusion
+The random forest algorithm is very accurate in classifying how well someone performed a bicep curl with a dumbell.
